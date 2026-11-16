@@ -1322,10 +1322,10 @@ int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
 	if (rc < 0)
 		goto err;
 
-	rc = r82xx_set_vga_gain(priv);
-	if (rc < 0)
-		goto err;
-
+	/* SDRBridge: the VGA gain is set by r82xx_set_gain() only, as rtl_tcp_andro (osmocom)
+	 * does. The RTL-SDR Blog code set it to 16.3 dB on every retune: in auto gain mode that
+	 * replaced the 26.5 dB of r82xx_set_gain() after the first retune, 10 dB less IF gain
+	 * than rtl_tcp_andro, and signals that rtl_tcp_andro shows didn't. */
 	rc = r82xx_set_pll(priv, lo_freq);
 	if (rc >= 0 && !priv->has_lock)
 		fprintf(stderr, "[R82XX] PLL not locked for %u Hz (LO %u Hz), even after programming it again\n", freq, lo_freq);

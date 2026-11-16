@@ -23,7 +23,6 @@
  */
 
 #include <stdio.h>
-#include <unistd.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -44,7 +43,7 @@
 
 /* Those initial values start from REG_SHADOW_START */
 static const uint8_t r82xx_init_array[NUM_REGS] = {
-	0x83, 0x30, 0x75,			/* 05 to 07 */
+	0x83, 0x32, 0x75,			/* 05 to 07 */
 	0xc0, 0x40, 0xd6, 0x6c,			/* 08 to 0b */
 	0xf5, 0x63, 0x75, 0x68,			/* 0c to 0f */
 	0x6c, 0x83, 0x80, 0x00,			/* 10 to 13 */
@@ -291,23 +290,9 @@ static int r82xx_write(struct r82xx_priv *priv, uint8_t reg, const uint8_t *val,
 	return 0;
 }
 
-static int r82xx_read_cache_reg(struct r82xx_priv *priv, int reg);
-
-/* SDRBridge: every register write is a USB control transfer (~2 ms on Android), and a
- * retune rewrote many registers with the value they already hold. Skip the write when the
- * shadow copy (an exact copy of everything written) already holds the value. Only once
- * r82xx_init() has written all the registers: before that the shadow copy is not valid. */
-static int r82xx_write_reg_if_changed(struct r82xx_priv *priv, uint8_t reg, uint8_t val)
-{
-	if (priv->init_done && r82xx_read_cache_reg(priv, reg) == val)
-		return 0;
-
-	return r82xx_write(priv, reg, &val, 1);
-}
-
 static int r82xx_write_reg(struct r82xx_priv *priv, uint8_t reg, uint8_t val)
 {
-	return r82xx_write_reg_if_changed(priv, reg, val);
+	return r82xx_write(priv, reg, &val, 1);
 }
 
 static int r82xx_read_cache_reg(struct r82xx_priv *priv, int reg)
@@ -322,22 +307,6 @@ static int r82xx_read_cache_reg(struct r82xx_priv *priv, int reg)
 
 static int r82xx_write_reg_mask(struct r82xx_priv *priv, uint8_t reg, uint8_t val,
 				uint8_t bit_mask)
-{
-	int rc = r82xx_read_cache_reg(priv, reg);
-
-	if (rc < 0)
-		return rc;
-
-	val = (rc & ~bit_mask) | (val & bit_mask);
-
-	return r82xx_write_reg_if_changed(priv, reg, val);
-}
-
-/* SDRBridge: as r82xx_write_reg_mask(), but always writes the register, even if its
- * value didn't change (as rtl_tcp_andro's osmocom code does). Used for the R828D PLL
- * programming in r82xx_set_pll(). */
-static int r82xx_write_reg_mask_always(struct r82xx_priv *priv, uint8_t reg, uint8_t val,
-				       uint8_t bit_mask)
 {
 	int rc = r82xx_read_cache_reg(priv, reg);
 
@@ -455,39 +424,9 @@ static int r82xx_set_mux(struct r82xx_priv *priv, uint32_t freq)
 	return rc;
 }
 
-/* SDRBridge: the RTL-SDR Blog code changed several R820T/R828D settings for its own
- * dongles (V4, V4 Lite) and applied them to every dongle: VCO current, PLL divider buffer
- * current, IF filter gain, loop-through. On a plain R820T dongle they made a strong signal
- * show as drifting spikes at other frequencies (absent with rtl_tcp_andro's osmocom
- * librtlsdr). Plain dongles keep the osmocom settings.
- * The RTL-SDR Blog V4 (R828D) never locked its PLL with the Blog settings, while
- * rtl_tcp_andro (osmocom settings) works on it: every dongle now gets the osmocom
- * settings, including the V4 and V4 Lite. To restore the Blog settings on those, return
- *   rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4") ||
- *   rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4L");
- * (The V4 upconversion and input switching in r82xx_set_freq() don't depend on this.) */
-static int r82xx_is_rtlsdr_blog(struct r82xx_priv *priv)
-{
-	(void)priv;
-	return 0;
-}
-
-/* SDRBridge: r82xx_init_array with register 0x06 as in osmocom (0x32) on plain dongles.
- * The RTL-SDR Blog code changed it to 0x30. */
-static void r82xx_get_init_array(struct r82xx_priv *priv, uint8_t *regs)
-{
-	memcpy(regs, r82xx_init_array, sizeof(r82xx_init_array));
-	if (!r82xx_is_rtlsdr_blog(priv))
-		regs[0x06 - REG_SHADOW_START] = 0x32;
-}
-
-#define PLL_LOCK_CHECKS		6
-#define PLL_LOCK_RETRY_US	1000
-#define PLL_PROGRAM_ATTEMPTS	2
-
 static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 {
-	int rc, i, attempt, is_rtlsdr_blog, is_r828d, k, div_base;
+	int rc, i;
 	unsigned sleep_time = 10000;
 	uint64_t vco_freq;
 	uint32_t vco_fra;	/* VCO contribution by SDM (kHz) */
@@ -503,27 +442,23 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	uint8_t refdiv2 = 0;
 	uint8_t ni, si, nint, vco_fine_tune, val;
 	uint8_t data[5];
-	uint8_t pll_regs[7]; /* SDRBridge: registers 0x10 to 0x16 */
 
 	/* Frequency in kHz */
 	freq_khz = (freq + 500) / 1000;
 	pll_ref = priv->cfg->xtal;
 	pll_ref_khz = (priv->cfg->xtal + 500) / 1000;
 
-	is_r828d = priv->cfg->rafael_chip == CHIP_R828D ||
-		   rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4L");
-
-	/* SDRBridge: R828D, as rtl_tcp_andro: refdiv2 first (on the other tuners it is
-	 * written with the PLL registers below) */
-	if (is_r828d) {
-		rc = r82xx_write_reg_mask_always(priv, 0x10, refdiv2, 0x10);
-		if (rc < 0)
-			return rc;
-	}
+	rc = r82xx_write_reg_mask(priv, 0x10, refdiv2, 0x10);
+	if (rc < 0)
+		return rc;
 
 	/* set pll autotune = 128kHz */
-	rc = is_r828d ? r82xx_write_reg_mask_always(priv, 0x1a, 0x00, 0x0c)
-		      : r82xx_write_reg_mask(priv, 0x1a, 0x00, 0x0c);
+	rc = r82xx_write_reg_mask(priv, 0x1a, 0x00, 0x0c);
+	if (rc < 0)
+		return rc;
+
+	/* set VCO current = 100 */
+	rc = r82xx_write_reg_mask(priv, 0x12, 0x80, 0xe0);
 	if (rc < 0)
 		return rc;
 
@@ -541,49 +476,23 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 		mix_div = mix_div << 1;
 	}
 
-	if (is_r828d)
-		vco_power_ref = 1;
-
-	/* VCO current, before reading the VCO fine tune status (as the original code).
-	 * SDRBridge: the RTL-SDR Blog sets it to the maximum (0x12 = 0x06, whole register);
-	 * plain dongles keep the osmocom setting: VCO current = 100 (bits 7-5), the other
-	 * bits unchanged. See r82xx_is_rtlsdr_blog(). */
-	is_rtlsdr_blog = r82xx_is_rtlsdr_blog(priv);
-	if (is_rtlsdr_blog)
-		/* RTL-SDR Blog Modification: Set VCO current to MAX */
-		rc = r82xx_write_reg_mask(priv, 0x12, 0x06, 0xff);
-	else
-		/* set VCO current = 100 */
-		rc = is_r828d ? r82xx_write_reg_mask_always(priv, 0x12, 0x80, 0xe0)
-			      : r82xx_write_reg_mask(priv, 0x12, 0x80, 0xe0);
-	if (rc < 0)
-		return rc;
-
-	/* VCO fine tune status of the current (settled) frequency, read at the start of each
-	 * retune as the original code does */
 	rc = r82xx_read(priv, 0x00, data, sizeof(data));
 	if (rc < 0)
 		return rc;
 
+	if (priv->cfg->rafael_chip == CHIP_R828D || rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4L"))
+		vco_power_ref = 1;
+
 	vco_fine_tune = (data[4] & 0x30) >> 4;
-
-	/* SDRBridge: on the R820T/R820T2 (vco_power_ref = 2), the fine tune status comes from
-	 * the VCO at the previous frequency. When that retune didn't lock (or before the first
-	 * retune), it is meaningless (it read 3 instead of 2 after each lock failure) and the
-	 * adjustment below picked the wrong divider: the tuner then went to twice the
-	 * requested frequency. Use the status of a locked VCO (2) instead: no adjustment.
-	 * The R828D (vco_power_ref = 1) always uses the status as read, like rtl_tcp_andro
-	 * and the RTL-SDR Blog driver: overriding it there kept the PLL from ever locking
-	 * (has_lock stayed 0, so every retune used the overridden value again). */
-	if (!priv->has_lock && vco_power_ref == 2)
-		vco_fine_tune = 2;
-
-	div_base = div_num; /* SDRBridge: before the fine tune adjustment, see below */
 
 	if (vco_fine_tune > vco_power_ref)
 		div_num = div_num - 1;
 	else if (vco_fine_tune < vco_power_ref)
 		div_num = div_num + 1;
+
+	rc = r82xx_write_reg_mask(priv, 0x10, div_num << 5, 0xe0);
+	if (rc < 0)
+		return rc;
 
 	vco_freq = (uint64_t)freq * (uint64_t)mix_div;
 	nint = vco_freq / (2 * pll_ref);
@@ -597,11 +506,19 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	ni = (nint - 13) / 4;
 	si = nint - 4 * ni - 13;
 
+	rc = r82xx_write_reg(priv, 0x14, ni + (si << 6));
+	if (rc < 0)
+		return rc;
+
 	/* pw_sdm */
 	if (!vco_fra)
 		val = 0x08;
 	else
 		val = 0x00;
+
+	rc = r82xx_write_reg_mask(priv, 0x12, val, 0x08);
+	if (rc < 0)
+		return rc;
 
 	/* sdm calculator */
 	while (vco_fra > 1) {
@@ -614,136 +531,36 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 		n_sdm <<= 1;
 	}
 
-	/* SDRBridge: registers 0x10 to 0x16 are written in a single I2C transfer (7 bytes,
-	 * within max_i2c_msg_len) instead of 6 separate writes. The values are the same as
-	 * the ones the separate writes produced:
-	 *  0x10: refdiv2 (bit 4) and divider (bits 7-5), other bits unchanged
-	 *  0x11, 0x13: unchanged (current shadow value)
-	 *  0x12: VCO current written above and pw_sdm (bit 3)
-	 *  0x14: ni / si, 0x15 / 0x16: sdm */
-	pll_regs[0] = (r82xx_read_cache_reg(priv, 0x10) & ~0xf0) | (refdiv2 & 0x10) | ((div_num << 5) & 0xe0);
-	pll_regs[1] = r82xx_read_cache_reg(priv, 0x11);
-	pll_regs[2] = (r82xx_read_cache_reg(priv, 0x12) & ~0x08) | val;
-	pll_regs[3] = r82xx_read_cache_reg(priv, 0x13);
-	pll_regs[4] = ni + (si << 6);
-	pll_regs[5] = sdm & 0xff;
-	pll_regs[6] = sdm >> 8;
-
-	if (is_r828d) {
-		/* SDRBridge: R828D, as rtl_tcp_andro: separate writes, always sent, in its
-		 * order (divider, ni/si, pw_sdm, sdm high byte, then low byte) */
-		rc = r82xx_write_reg_mask_always(priv, 0x10, div_num << 5, 0xe0);
-		if (rc < 0)
-			return rc;
-		rc = r82xx_write_reg_mask_always(priv, 0x14, ni + (si << 6), 0xff);
-		if (rc < 0)
-			return rc;
-		rc = r82xx_write_reg_mask_always(priv, 0x12, val, 0x08);
-		if (rc < 0)
-			return rc;
-		rc = r82xx_write_reg_mask_always(priv, 0x16, sdm >> 8, 0xff);
-		if (rc < 0)
-			return rc;
-		rc = r82xx_write_reg_mask_always(priv, 0x15, sdm & 0xff, 0xff);
-	} else {
-		rc = r82xx_write(priv, 0x10, pll_regs, sizeof(pll_regs));
-	}
+	rc = r82xx_write_reg(priv, 0x16, sdm >> 8);
+	if (rc < 0)
+		return rc;
+	rc = r82xx_write_reg(priv, 0x15, sdm & 0xff);
 	if (rc < 0)
 		return rc;
 
-	/* SDRBridge: the original Linux driver waited before checking the lock, the RTL-SDR
-	 * Blog version checks right away (sleep commented out) and some frequencies weren't
-	 * locked yet at that instant. Re-check up to PLL_LOCK_CHECKS times, PLL_LOCK_RETRY_US
-	 * apart. If the PLL still isn't locked, program it a second time (autotune and PLL
-	 * registers) and check again: the samples of an unlocked tuner show the signals at the
-	 * wrong frequency. This only costs time when the first check fails.
-	 * The second programming raises the VCO current one step (osmocom: 0x60 instead of
-	 * 0x80 in bits 7-5) on non RTL-SDR Blog dongles; the Blog setting is already the
-	 * maximum. (The Blog code rewrote register 0x12 with 0x06 after a failed check: that
-	 * also cleared pw_sdm, so it is not done anymore.)
-	 * The R828D (vco_power_ref = 1) does as rtl_tcp_andro instead: it only raises the VCO
-	 * current and checks again, without programming the PLL a second time. */
-	for (attempt = 0; attempt < PLL_PROGRAM_ATTEMPTS; attempt++) {
-		if (attempt > 0 && is_r828d) {
-			/* Didn't lock. Increase VCO current (rtl_tcp_andro) */
-			rc = r82xx_write_reg_mask_always(priv, 0x12, 0x60, 0xe0);
-			if (rc < 0)
-				return rc;
-		} else if (attempt > 0) {
-			if (!is_rtlsdr_blog)
-				pll_regs[2] = (pll_regs[2] & ~0xe0) | 0x60;
-			rc = r82xx_write_reg_mask(priv, 0x1a, 0x00, 0x0c);
-			if (rc < 0)
-				return rc;
-			rc = r82xx_write(priv, 0x10, pll_regs, sizeof(pll_regs));
-			if (rc < 0)
-				return rc;
-		}
+	for (i = 0; i < 2; i++) {
+//		usleep_range(sleep_time, sleep_time + 1000);
 
-		for (i = 0; i < PLL_LOCK_CHECKS; i++) {
-//			usleep_range(sleep_time, sleep_time + 1000);
-			if (i > 0)
-				usleep(PLL_LOCK_RETRY_US);
-
-			/* Check if PLL has locked */
-			rc = r82xx_read(priv, 0x00, data, 3);
-			if (rc < 0)
-				return rc;
-			if (data[2] & 0x40)
-				break;
-		}
+		/* Check if PLL has locked */
+		rc = r82xx_read(priv, 0x00, data, 3);
+		if (rc < 0)
+			return rc;
 		if (data[2] & 0x40)
 			break;
-	}
 
-	/* SDRBridge: R828D (RTL-SDR Blog V4). The divider adjustment above relies on the VCO
-	 * fine tune status left by the previous lock. When there was none (first retune: unlike
-	 * rtl_tcp_andro, SDR Bridge doesn't tune to 28.8 MHz when setting the sample rate) or
-	 * the previous retune didn't lock, that status is meaningless, the divider is wrong and
-	 * the PLL never locks: every retry read a meaningless status again (seen on a V4 at
-	 * 537.5 MHz: "PLL still not locked after 5 retries"). Try the other dividers the
-	 * adjustment can give (div_base - 1, div_base, div_base + 1) and keep the one that
-	 * locks. The VCO frequency (nint, sdm) doesn't depend on the divider register. */
-	if (!(data[2] & 0x40) && is_r828d) {
-		for (k = -1; k <= 1 && !(data[2] & 0x40); k++) {
-			int cand = div_base + k;
-
-			if (cand < 0 || cand > 7 || cand == div_num)
-				continue;
-
-			rc = r82xx_write_reg_mask_always(priv, 0x10, cand << 5, 0xe0);
+		if (!i) {
+			/* Didn't lock. Increase VCO current */
+			rc = r82xx_write_reg_mask(priv, 0x12, 0x60, 0xe0);
 			if (rc < 0)
 				return rc;
-			rc = r82xx_write_reg_mask_always(priv, 0x16, sdm >> 8, 0xff);
-			if (rc < 0)
-				return rc;
-			rc = r82xx_write_reg_mask_always(priv, 0x15, sdm & 0xff, 0xff);
-			if (rc < 0)
-				return rc;
-
-			for (i = 0; i < PLL_LOCK_CHECKS; i++) {
-				if (i > 0)
-					usleep(PLL_LOCK_RETRY_US);
-				rc = r82xx_read(priv, 0x00, data, 3);
-				if (rc < 0)
-					return rc;
-				if (data[2] & 0x40)
-					break;
-			}
-			if (data[2] & 0x40)
-				fprintf(stderr, "[R82XX] PLL locked at LO %u Hz with divider %d instead of %d\n",
-					freq, cand, div_num);
 		}
 	}
 
 	if (!(data[2] & 0x40)) {
-		/* reported with the frequency by r82xx_set_freq() */
+		fprintf(stderr, "[R82XX] PLL not locked!\n");
 		priv->has_lock = 0;
 		return 0;
 	}
-
-	if (attempt > 0)
-		fprintf(stderr, "[R82XX] PLL locked at LO %u Hz after programming it again\n", freq);
 
 	priv->has_lock = 1;
 
@@ -856,12 +673,6 @@ static int r82xx_sysfreq_sel(struct r82xx_priv *priv, uint32_t freq,
 	rc = r82xx_write_reg_mask(priv, 0x11, cp_cur, 0x38);
 	if (rc < 0)
 		return rc;
-
-	/* RTL-SDR Blog Hack. Improve L-band performance by setting PLL drop out to 2.0v
-	 * SDRBridge: RTL-SDR Blog dongles only, see r82xx_is_rtlsdr_blog() */
-	if (r82xx_is_rtlsdr_blog(priv))
-		div_buf_cur = 0xa0;
-
 	rc = r82xx_write_reg_mask(priv, 0x17, div_buf_cur, 0x30);
 	if (rc < 0)
 		return rc;
@@ -972,24 +783,18 @@ static int r82xx_set_tv_standard(struct r82xx_priv *priv,
 	/* BW < 6 MHz */
 	if_khz = 3570;
 	filt_cal_lo = 56000;	/* 52000->56000 */
-	filt_gain = 0x30;	/* +3db, 6mhz on */
+	filt_gain = 0x10;	/* +3db, 6mhz on */
 	img_r = 0x00;		/* image negative */
 	filt_q = 0x10;		/* r10[4]:low q(1'b1) */
 	hp_cor = 0x6b;		/* 1.7m disable, +2cap, 1.0mhz */
 	ext_enable = 0x60;	/* r30[6]=1 ext enable; r30[5]:1 ext at lna max-1 */
-	loop_through = 0x80;	/* r5[7], lt off */
+	loop_through = 0x01;	/* r5[7], lt off */
 	lt_att = 0x00;		/* r31[7], lt att enable */
 	flt_ext_widest = 0x00;	/* r15[7]: flt_ext_wide off */
 	polyfil_cur = 0x60;	/* r25[6:5]:min */
 
-	/* SDRBridge: osmocom values on plain dongles, see r82xx_is_rtlsdr_blog() */
-	if (!r82xx_is_rtlsdr_blog(priv)) {
-		filt_gain = 0x10;
-		loop_through = 0x01;
-	}
-
 	/* Initialize the shadow registers */
-	r82xx_get_init_array(priv, priv->regs);
+	memcpy(priv->regs, r82xx_init_array, sizeof(r82xx_init_array));
 
 	/* Init Flag & Xtal_check Result (inits VGA gain, needed?)*/
 	rc = r82xx_write_reg_mask(priv, 0x0c, 0x00, 0x0f);
@@ -1172,7 +977,8 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain)
 		if (rc < 0)
 			return rc;
 
-		rc = r82xx_set_vga_gain(priv);
+		/* set fixed VGA gain for now (16.3 dB) */
+		rc = r82xx_write_reg_mask(priv, 0x0c, 0x08, 0x9f);
 		if (rc < 0)
 			return rc;
 
@@ -1210,34 +1016,11 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain)
 
 		/* set fixed VGA gain for now (26.5 dB) */
 		rc = r82xx_write_reg_mask(priv, 0x0c, 0x0b, 0x9f);
-
 		if (rc < 0)
 			return rc;
 	}
 
 	return 0;
-}
-
-int r82xx_set_vga_gain(struct r82xx_priv *priv) {
-
-	int rc;
-
-	/* set fixed VGA gain based on frequency */
-	/* Disable for now. While it improves performance in some applications
-	   it appears to severely degrade performance in others */
-	/*if (priv->rf_freq > MHZ(1350)) {
-		rc = r82xx_write_reg_mask(priv, 0x0c, 0x0f, 0x9f); // Max 40.5 dB
-	}
-	else if (priv->rf_freq > MHZ(1000)) {
-		rc = r82xx_write_reg_mask(priv, 0x0c, 0x0b, 0x9f);
-	}
-	else {
-		rc = r82xx_write_reg_mask(priv, 0x0c, 0x08, 0x9f); // 16.3 dB
-	}*/
-
-	rc = r82xx_write_reg_mask(priv, 0x0c, 0x08, 0x9f); // 16.3 dB
-
-	return rc;
 }
 
 /* Bandwidth contribution by low-pass filter. */
@@ -1313,25 +1096,6 @@ int r82xx_set_bandwidth(struct r82xx_priv *priv, int bw, uint32_t rate)
 
 	return priv->int_freq;
 }
-
-int r82xx_toggle_test(struct r82xx_priv *priv, int toggle)
-{
-	int rc;
-
-	if (toggle)
-	{
-		fprintf(stderr, "TOGGLE ON \n");
-		rc = r82xx_write_reg_mask(priv, 0x17, 0x08, 0x08); /* open_d notch on */
-	}
-	else
-	{
-		fprintf(stderr, "TOGGLE OFF \n");
-		rc = r82xx_write_reg_mask(priv, 0x17, 0x00, 0x08); /* open_d notch off */
-	}
-
-	return rc;
-}
-
 #undef FILT_HP_BW1
 #undef FILT_HP_BW2
 
@@ -1355,8 +1119,6 @@ int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
 	/* if it's an RTL-SDR Blog V4, automatically upconvert by 28.8 MHz if we tune to HF
 	 * so that we don't need to manually set any upconvert offset in the SDR software */
 	upconvert_freq = (is_rtlsdr_blog_v4 || is_rtlsdr_blog_v4l) ? ((freq < MHZ(28.8)) ? (freq + MHZ(28.8)) : freq) : freq;
-    
-	//priv->rf_freq = upconvert_freq;
 
 	lo_freq = upconvert_freq + priv->int_freq;
 
@@ -1364,13 +1126,7 @@ int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
 	if (rc < 0)
 		goto err;
 
-	/* SDRBridge: the VGA gain is set by r82xx_set_gain() only, as rtl_tcp_andro (osmocom)
-	 * does. The RTL-SDR Blog code set it to 16.3 dB on every retune: in auto gain mode that
-	 * replaced the 26.5 dB of r82xx_set_gain() after the first retune, 10 dB less IF gain
-	 * than rtl_tcp_andro, and signals that rtl_tcp_andro shows didn't. */
 	rc = r82xx_set_pll(priv, lo_freq);
-	if (rc >= 0 && !priv->has_lock)
-		fprintf(stderr, "[R82XX] PLL not locked for %u Hz (LO %u Hz), even after programming it again\n", freq, lo_freq);
 	if (rc < 0 || !priv->has_lock)
 		goto err;
 
@@ -1495,10 +1251,11 @@ int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
 		}
 	}
 
-err:
+	err:
 	if (rc < 0)
 		fprintf(stderr, "%s: failed=%d\n", __FUNCTION__, rc);
 	return rc;
+
 }
 
 /*
@@ -1562,7 +1319,7 @@ static int r82xx_xtal_check(struct r82xx_priv *priv)
 	uint8_t data[3], val;
 
 	/* Initialize the shadow registers */
-	r82xx_get_init_array(priv, priv->regs);
+	memcpy(priv->regs, r82xx_init_array, sizeof(r82xx_init_array));
 
 	/* cap 30pF & Drive Low */
 	rc = r82xx_write_reg_mask(priv, 0x10, 0x0b, 0x0b);
@@ -1618,14 +1375,12 @@ int r82xx_init(struct r82xx_priv *priv)
 {
 	int rc;
 
-	uint8_t init_regs[NUM_REGS];
-
 	/* TODO: R828D might need r82xx_xtal_check() */
 	priv->xtal_cap_sel = XTAL_HIGH_CAP_0P;
 
 	/* Initialize registers */
-	r82xx_get_init_array(priv, init_regs);
-	rc = r82xx_write(priv, 0x05, init_regs, sizeof(init_regs));
+	rc = r82xx_write(priv, 0x05,
+			 r82xx_init_array, sizeof(r82xx_init_array));
 
 	rc = r82xx_set_tv_standard(priv, 3, TUNER_DIGITAL_TV, 0);
 	if (rc < 0)
@@ -1649,74 +1404,24 @@ static int r82xx_gpio(struct r82xx_priv *priv, int enable)
 }
 #endif
 
-/* SDRBridge safety net: with the I2C gate left open (see rtlsdr_set_center_freq()), fast
- * retuning sometimes made the tuner stop answering and lose its configuration (registers
- * read 0xff, no signal while the PLL kept locking). This reads the registers back,
- * compares them with the shadow copy and rewrites the ones that differ, reporting them in
- * `report`.
- * - The R820T is read from register 0x00, and the RTL2832U refuses long I2C reads: the
- *   longest working read is probed the first time (30, 24, 16 then 8 bytes).
- * - The first check records the registers that already read back differently from what
- *   was written (status bits): those are ignored afterwards.
- * Returns the number of registers rewritten, 0 if all match, -1 if unavailable. */
+/*
+ * SDRBridge: this file is rtl_tcp_andro's tuner_r82xx.c (signalwareltd/rtl_tcp_andro-),
+ * which locks the RTL-SDR Blog V4 (R828D) PLL where SDR Bridge's modified version
+ * never did ("PLL not locked" on every retune). Only the two functions librtlsdr.c
+ * needs are added below.
+ */
+
+/* RTL-SDR Blog: notch filter on/off through the test mode command */
+int r82xx_toggle_test(struct r82xx_priv *priv, int toggle)
+{
+	return r82xx_write_reg_mask(priv, 0x17, toggle ? 0x08 : 0x00, 0x08);
+}
+
+/* SDRBridge's register check and rewrite is not done: rtl_tcp_andro doesn't do it */
 int r82xx_verify_registers(struct r82xx_priv *priv, char *report, int report_len)
 {
-	static const int probe_lens[] = { 30, 24, 16, 8 };
-	uint8_t hw[NUM_REGS];
-	int i, reg, rc, len = 0, repaired = 0;
-
-	report[0] = 0;
-	if (!priv->init_done || priv->verify_len < 0)
-		return -1;
-
-	if (priv->verify_len == 0) {
-		for (i = 0; i < (int) ARRAY_SIZE(probe_lens); i++) {
-			if (r82xx_read(priv, 0x00, hw, probe_lens[i]) == 0) {
-				priv->verify_len = probe_lens[i];
-				break;
-			}
-		}
-		if (priv->verify_len == 0) {
-			priv->verify_len = -1;
-			snprintf(report, report_len, "register check unavailable (no read length works)");
-			return -1;
-		}
-		len += snprintf(report + len, report_len - len, "reads of %d bytes (registers 0x05-0x%02x). ",
-				priv->verify_len, priv->verify_len - 1);
-	} else {
-		rc = r82xx_read(priv, 0x00, hw, priv->verify_len);
-		if (rc < 0) {
-			snprintf(report, report_len, "register read failed (%d)", rc);
-			return -1;
-		}
-	}
-
-	for (reg = REG_SHADOW_START; reg < priv->verify_len; reg++) {
-		uint8_t expected = priv->regs[reg - REG_SHADOW_START];
-
-		if (hw[reg] == expected || (priv->verify_ignored & (1u << reg)))
-			continue;
-
-		if (!priv->verify_baseline_done) {
-			priv->verify_ignored |= 1u << reg;
-			len += snprintf(report + len, report_len - len, "0x%02x reads 0x%02x (written 0x%02x): ignored. ",
-					reg, hw[reg], expected);
-			continue;
-		}
-
-		/* corrupted: write the expected value back */
-		r82xx_write(priv, reg, &expected, 1);
-		repaired++;
-		len += snprintf(report + len, report_len - len, "0x%02x was 0x%02x instead of 0x%02x: rewritten. ",
-				reg, hw[reg], expected);
-		if (len >= report_len - 1)
-			break;
-	}
-
-	if (!priv->verify_baseline_done) {
-		priv->verify_baseline_done = 1;
-		if (len == 0)
-			snprintf(report, report_len, "all registers read back as written");
-	}
-	return repaired;
+	(void)priv;
+	if (report_len > 0)
+		report[0] = 0;
+	return -1;
 }

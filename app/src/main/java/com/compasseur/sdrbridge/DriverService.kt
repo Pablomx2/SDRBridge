@@ -426,6 +426,7 @@ class DriverService : Service() {
                     write(receivedBytes)
                     flush()
                 }
+                if (rfSource is RtlSdr) RtlSdr.statBytesSent.addAndGet(receivedBytes.size.toLong())
             }
         } catch (e: Exception) {
             LogParameters.appendLine("$logTag, Error sending samples: ${e.message}")

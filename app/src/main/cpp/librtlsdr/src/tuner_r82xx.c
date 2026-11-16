@@ -484,6 +484,7 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 		vco_power_ref = 1;
 
 	vco_fine_tune = (data[4] & 0x30) >> 4;
+	priv->dbg_fine_tune = vco_fine_tune; /* SDRBridge diagnostics */
 
 	if (vco_fine_tune > vco_power_ref)
 		div_num = div_num - 1;
@@ -534,6 +535,14 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	rc = r82xx_write_reg(priv, 0x16, sdm >> 8);
 	if (rc < 0)
 		return rc;
+	/* SDRBridge diagnostics */
+	priv->dbg_lo = freq;
+	priv->dbg_xtal = pll_ref;
+	priv->dbg_mix_div = mix_div;
+	priv->dbg_div_num = div_num;
+	priv->dbg_nint = nint;
+	priv->dbg_sdm = sdm;
+
 	rc = r82xx_write_reg(priv, 0x15, sdm & 0xff);
 	if (rc < 0)
 		return rc;

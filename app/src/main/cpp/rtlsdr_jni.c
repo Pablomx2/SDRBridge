@@ -242,3 +242,11 @@ JNIEXPORT jint JNICALL
 JNI_FN(nativeTunerLocked)(JNIEnv *env, jobject thiz, jlong handle) {
     return rtlsdr_tuner_locked(DEV(handle));
 }
+
+// Diagnostics: what the driver programmed into the tuner, see rtlsdr_get_tuner_debug()
+JNIEXPORT jstring JNICALL
+JNI_FN(nativeGetTunerDebug)(JNIEnv *env, jobject thiz, jlong handle) {
+    char buf[512];
+    if (rtlsdr_get_tuner_debug(DEV(handle), buf, sizeof(buf)) < 0) return NULL;
+    return (*env)->NewStringUTF(env, buf);
+}

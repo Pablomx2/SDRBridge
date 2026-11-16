@@ -37,4 +37,7 @@ RTLSDR_API int rtlsdr_set_center_freq_and_verify(rtlsdr_dev_t *dev, uint32_t fre
 RTLSDR_API int rtlsdr_reinit_tuner(rtlsdr_dev_t *dev);
 RTLSDR_API int rtlsdr_tuner_locked(rtlsdr_dev_t *dev);
 
+/* SDRBridge diagnostics, see librtlsdr.c */
+RTLSDR_API int rtlsdr_get_tuner_debug(rtlsdr_dev_t *dev, char *buf, int len);
+
 #endif /* __RTL_ANDRO_SDR_H */

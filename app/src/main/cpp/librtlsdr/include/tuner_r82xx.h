@@ -84,6 +84,9 @@ struct r82xx_priv {
 	uint8_t				fil_cal_code;
 	uint8_t				input;
 	int				has_lock;
+	/* SDRBridge diagnostics: what the last r82xx_set_pll() programmed */
+	uint32_t			dbg_lo, dbg_xtal;
+	int				dbg_mix_div, dbg_div_num, dbg_fine_tune, dbg_nint, dbg_sdm;
 	int				init_done;
 
 	/* SDRBridge: register check, see r82xx_verify_registers() */

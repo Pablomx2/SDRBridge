@@ -417,7 +417,17 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
                 "queue ${queue?.size ?: -1}"
         Log.i(logTag, line)
         LogParameters.appendLine("$logTag, $line")
+        val h = handle
+        if (h != 0L) {
+            val tuner = nativeGetTunerDebug(h)
+            // Only when it changed, to keep the log readable
+            if (tuner != null && tuner != lastTunerDebug) {
+                lastTunerDebug = tuner
+                LogParameters.appendLine("$logTag, Tuner: $tuner")
+            }
+        }
     }
+    private var lastTunerDebug: String? = null
 
     override fun getBufferFromBufferPool(): ByteArray {
         return bufferPool?.poll() ?: ByteArray(packetSize)
@@ -701,5 +711,6 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
     private external fun nativeCancelAsync(handle: Long): Int
     private external fun nativeSetCenterFreqAndVerify(handle: Long, frequency: Long, result: IntArray): String?
     private external fun nativeReinitTuner(handle: Long): Int
+    private external fun nativeGetTunerDebug(handle: Long): String?
     private external fun nativeTunerLocked(handle: Long): Int
 }

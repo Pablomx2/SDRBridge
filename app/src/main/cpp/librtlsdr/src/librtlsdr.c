@@ -111,6 +111,7 @@ struct rtlsdr_dev {
 	uint32_t bw;
 	uint32_t offs_freq; /* Hz */
 	int corr; /* ppm */
+	uint32_t dbg_if_freq; /* SDRBridge diagnostics: last IF given to the demodulator */
 	int gain; /* tenth dB */
 	struct e4k_state e4k_s;
 	struct r82xx_config r82xx_c;
@@ -719,6 +720,7 @@ static int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
 		return -2;
 
 	if_freq = ((freq * TWO_POW(22)) / rtl_xtal) * (-1);
+	dev->dbg_if_freq = freq;
 
 	tmp = (if_freq >> 16) & 0x3f;
 	r = rtlsdr_demod_write_reg(dev, 1, 0x19, tmp, 1);
@@ -2279,4 +2281,27 @@ int rtlsdr_reinit_tuner(rtlsdr_dev_t *dev)
 	r = dev->tuner->init(dev);
 	rtlsdr_set_i2c_repeater(dev, 0);
 	return r;
+}
+
+/* SDRBridge diagnostics: what the driver programmed into the tuner and the demodulator.
+ * The PLL output is the VCO (xtal * 2 * (nint + sdm / 65536)) divided by 2^(div_num + 1);
+ * the tuner then listens at that LO minus the demodulator IF. */
+int rtlsdr_get_tuner_debug(rtlsdr_dev_t *dev, char *buf, int len)
+{
+	struct r82xx_priv *p;
+	double vco, out;
+
+	if (!dev || len <= 0)
+		return -1;
+	p = &dev->r82xx_p;
+	vco = (double)p->dbg_xtal * 2.0 * ((double)p->dbg_nint + (double)p->dbg_sdm / 65536.0);
+	out = vco / (double)(1 << (p->dbg_div_num + 1));
+	return snprintf(buf, len,
+		"freq %u, rate %u, bw %u, offs %u, ds %d, rtl_xtal %u, tun_xtal %u, corr %d, "
+		"tuner int_freq %u, demod IF %u, LO asked %u, xtal %u, mix_div %d, div_num %d, "
+		"fine_tune %d, nint %d, sdm %d, VCO %.0f, PLL out %.0f, listening at %.0f Hz, lock %d",
+		dev->freq, dev->rate, dev->bw, dev->offs_freq, dev->direct_sampling, dev->rtl_xtal,
+		dev->tun_xtal, dev->corr, p->int_freq, dev->dbg_if_freq, p->dbg_lo, p->dbg_xtal,
+		p->dbg_mix_div, p->dbg_div_num, p->dbg_fine_tune, p->dbg_nint, p->dbg_sdm, vco, out,
+		out - (double)dev->dbg_if_freq, p->has_lock);
 }

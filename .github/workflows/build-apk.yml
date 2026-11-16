@@ -1,0 +1,50 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK and CMake
+        run: sdkmanager --install "ndk;27.0.12077973" "cmake;3.22.1" "platforms;android-36"
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Rename APK
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/debug/app-debug.apk "out/SDRBridge-v2.02-v4fix-${GITHUB_SHA::7}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SDRBridge-v4fix-apk
+          path: out/*.apk
+
+      - name: Publish as a release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.02-v4fix-${{ github.run_number }}
+          name: SDRBridge v2.02 + RTL-SDR Blog V4 fix (test build ${{ github.run_number }})
+          prerelease: true
+          body: |
+            Test build of the RTL-SDR Blog V4 fix (restores the Blog tuner settings on the V4 / V4 Lite).
+            Debug-signed: uninstall any other SDR Bridge first, then install this APK.
+          files: out/*.apk

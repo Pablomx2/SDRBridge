@@ -12,8 +12,8 @@ android {
         applicationId = "com.compasseur.sdrbridge"
         minSdk = 29
         targetSdk = 36
-        versionCode = 11
-        versionName = "2.01"
+        versionCode = 12
+        versionName = "2.02"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

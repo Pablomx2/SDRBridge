@@ -487,7 +487,7 @@ static void r82xx_get_init_array(struct r82xx_priv *priv, uint8_t *regs)
 
 static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 {
-	int rc, i, attempt, is_rtlsdr_blog, is_r828d;
+	int rc, i, attempt, is_rtlsdr_blog, is_r828d, k, div_base;
 	unsigned sleep_time = 10000;
 	uint64_t vco_freq;
 	uint32_t vco_fra;	/* VCO contribution by SDM (kHz) */
@@ -577,6 +577,8 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	 * (has_lock stayed 0, so every retune used the overridden value again). */
 	if (!priv->has_lock && vco_power_ref == 2)
 		vco_fine_tune = 2;
+
+	div_base = div_num; /* SDRBridge: before the fine tune adjustment, see below */
 
 	if (vco_fine_tune > vco_power_ref)
 		div_num = div_num - 1;
@@ -692,6 +694,46 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 		}
 		if (data[2] & 0x40)
 			break;
+	}
+
+	/* SDRBridge: R828D (RTL-SDR Blog V4). The divider adjustment above relies on the VCO
+	 * fine tune status left by the previous lock. When there was none (first retune: unlike
+	 * rtl_tcp_andro, SDR Bridge doesn't tune to 28.8 MHz when setting the sample rate) or
+	 * the previous retune didn't lock, that status is meaningless, the divider is wrong and
+	 * the PLL never locks: every retry read a meaningless status again (seen on a V4 at
+	 * 537.5 MHz: "PLL still not locked after 5 retries"). Try the other dividers the
+	 * adjustment can give (div_base - 1, div_base, div_base + 1) and keep the one that
+	 * locks. The VCO frequency (nint, sdm) doesn't depend on the divider register. */
+	if (!(data[2] & 0x40) && is_r828d) {
+		for (k = -1; k <= 1 && !(data[2] & 0x40); k++) {
+			int cand = div_base + k;
+
+			if (cand < 0 || cand > 7 || cand == div_num)
+				continue;
+
+			rc = r82xx_write_reg_mask_always(priv, 0x10, cand << 5, 0xe0);
+			if (rc < 0)
+				return rc;
+			rc = r82xx_write_reg_mask_always(priv, 0x16, sdm >> 8, 0xff);
+			if (rc < 0)
+				return rc;
+			rc = r82xx_write_reg_mask_always(priv, 0x15, sdm & 0xff, 0xff);
+			if (rc < 0)
+				return rc;
+
+			for (i = 0; i < PLL_LOCK_CHECKS; i++) {
+				if (i > 0)
+					usleep(PLL_LOCK_RETRY_US);
+				rc = r82xx_read(priv, 0x00, data, 3);
+				if (rc < 0)
+					return rc;
+				if (data[2] & 0x40)
+					break;
+			}
+			if (data[2] & 0x40)
+				fprintf(stderr, "[R82XX] PLL locked at LO %u Hz with divider %d instead of %d\n",
+					freq, cand, div_num);
+		}
 	}
 
 	if (!(data[2] & 0x40)) {

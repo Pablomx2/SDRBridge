@@ -460,17 +460,16 @@ static int r82xx_set_mux(struct r82xx_priv *priv, uint32_t freq)
  * current, IF filter gain, loop-through. On a plain R820T dongle they made a strong signal
  * show as drifting spikes at other frequencies (absent with rtl_tcp_andro's osmocom
  * librtlsdr). Plain dongles keep the osmocom settings.
- * The RTL-SDR Blog V4 and V4 Lite keep the RTL-SDR Blog settings: they are the vendor's
- * settings for that hardware (loop-through off, +3 dB filter gain, VCO current at the
- * maximum, PLL divider buffer for L-band). v2.02 gave them the osmocom settings because
- * the V4 never locked its PLL; that was caused by the VCO fine tune override in
- * r82xx_set_pll() (fixed in the same commit), not by the Blog settings. With the osmocom
- * settings the V4 had its loop-through on (r5[7] cleared) and a weaker front end, and
- * signals that are plainly on didn't show. */
+ * The RTL-SDR Blog V4 (R828D) never locked its PLL with the Blog settings, while
+ * rtl_tcp_andro (osmocom settings) works on it: every dongle now gets the osmocom
+ * settings, including the V4 and V4 Lite. To restore the Blog settings on those, return
+ *   rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4") ||
+ *   rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4L");
+ * (The V4 upconversion and input switching in r82xx_set_freq() don't depend on this.) */
 static int r82xx_is_rtlsdr_blog(struct r82xx_priv *priv)
 {
-	return rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4") ||
-	       rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4L");
+	(void)priv;
+	return 0;
 }
 
 /* SDRBridge: r82xx_init_array with register 0x06 as in osmocom (0x32) on plain dongles.
@@ -664,14 +663,10 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	 * current and checks again, without programming the PLL a second time. */
 	for (attempt = 0; attempt < PLL_PROGRAM_ATTEMPTS; attempt++) {
 		if (attempt > 0 && is_r828d) {
-			/* Didn't lock. Increase VCO current (rtl_tcp_andro). On the RTL-SDR Blog
-			 * V4 it is already at the maximum (0x12 bits 7-5 = 000): writing 0x60
-			 * there would lower it, so only check again. */
-			if (!is_rtlsdr_blog) {
-				rc = r82xx_write_reg_mask_always(priv, 0x12, 0x60, 0xe0);
-				if (rc < 0)
-					return rc;
-			}
+			/* Didn't lock. Increase VCO current (rtl_tcp_andro) */
+			rc = r82xx_write_reg_mask_always(priv, 0x12, 0x60, 0xe0);
+			if (rc < 0)
+				return rc;
 		} else if (attempt > 0) {
 			if (!is_rtlsdr_blog)
 				pll_regs[2] = (pll_regs[2] & ~0xe0) | 0x60;

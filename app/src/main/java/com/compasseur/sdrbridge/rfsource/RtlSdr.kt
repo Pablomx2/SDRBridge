@@ -166,6 +166,17 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
         private const val lockRetryDelayMs: Long = 100
         private const val maxLockRetries: Int = 5
 
+        // Diagnostics: sample flow counters, logged every second while receiving (see logStats())
+        val statTransfers = java.util.concurrent.atomic.AtomicLong()
+        val statDroppedRetune = java.util.concurrent.atomic.AtomicLong()
+        val statDroppedLate = java.util.concurrent.atomic.AtomicLong()
+        val statQueued = java.util.concurrent.atomic.AtomicLong()
+        val statBytesSent = java.util.concurrent.atomic.AtomicLong()
+        val statRetunes = java.util.concurrent.atomic.AtomicLong()
+        val statRetuneCodes = java.util.concurrent.atomic.AtomicLong()
+        val statRetuneMsMax = java.util.concurrent.atomic.AtomicLong()
+        val statUnlocked = java.util.concurrent.atomic.AtomicLong()
+
         private val tunerNames = arrayOf("Unknown", "E4000", "FC0012", "FC0013", "FC2580", "R820T", "R828D")
 
         init {
@@ -227,6 +238,15 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
         // librtlsdr's async read blocks the calling thread for the whole session
         receiveThread = thread(name = "RtlSdrReceive") { readSamples() }
 
+        // Diagnostics: sample flow, once a second
+        listOf(statTransfers, statDroppedRetune, statDroppedLate, statQueued, statBytesSent, statRetunes,
+            statRetuneCodes, statRetuneMsMax, statUnlocked).forEach { it.set(0) }
+        try {
+            recoveryExecutor.scheduleAtFixedRate({ logStats() }, 1000, 1000, TimeUnit.MILLISECONDS)
+        } catch (e: RejectedExecutionException) {
+            // stopped
+        }
+
         // Reset the packet counter and start time for statistics:
         this.receiveStartTime = System.currentTimeMillis()
         this.receivePacketCounter = 0
@@ -267,8 +287,12 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
         val retune = retuneCount
         // Every transfer handed over after a retune counts, also the ones dropped by time
         val skipped = transfersToSkip.get() > 0 && transfersToSkip.getAndDecrement() > 0
+        statTransfers.incrementAndGet()
         // Recorded while retuning or settling (see setFrequency()): unusable
-        if (skipped || SystemClock.uptimeMillis() < dropSamplesUntil) return
+        if (skipped || SystemClock.uptimeMillis() < dropSamplesUntil) {
+            statDroppedRetune.incrementAndGet()
+            return
+        }
 
         val packet = if (length == packetSize) getBufferFromBufferPool() else ByteArray(length)
         samples.get(packet, 0, length)
@@ -279,6 +303,7 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
             // A retune started since this transfer was accepted: it holds samples of the
             // previous frequency and would reach the client after the retune
             if (retuneCount != retune) {
+                statDroppedRetune.incrementAndGet()
                 returnBufferToBufferPool(packet)
                 return
             }
@@ -286,12 +311,14 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
             // low (not the rtl_tcp header or a retune code: the client needs them)
             while (!queue.offer(packet)) {
                 val oldest = queue.firstOrNull { it.size == packetSize }
+                statDroppedLate.incrementAndGet()
                 if (oldest == null || !queue.remove(oldest)) {
                     returnBufferToBufferPool(packet)
                     return
                 }
                 returnBufferToBufferPool(oldest)
             }
+            statQueued.incrementAndGet()
         }
     }
 
@@ -380,6 +407,18 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
         }
     }
 
+    //Diagnostics: one line per second with the sample flow of the last second
+    private fun logStats() {
+        if (receiverMode != RTLSDR_RECEIVER_MODE_RECEIVE) return
+        val line = "Stats 1 s: USB transfers ${statTransfers.getAndSet(0)}, dropped (retune) ${statDroppedRetune.getAndSet(0)}, " +
+                "dropped (client late) ${statDroppedLate.getAndSet(0)}, queued ${statQueued.getAndSet(0)}, " +
+                "sent ${statBytesSent.getAndSet(0) / 1024} KB, retunes ${statRetunes.getAndSet(0)} " +
+                "(codes ${statRetuneCodes.getAndSet(0)}, max ${statRetuneMsMax.getAndSet(0)} ms, unlocked ${statUnlocked.getAndSet(0)}), " +
+                "queue ${queue?.size ?: -1}"
+        Log.i(logTag, line)
+        LogParameters.appendLine("$logTag, $line")
+    }
+
     override fun getBufferFromBufferPool(): ByteArray {
         return bufferPool?.poll() ?: ByteArray(packetSize)
     }
@@ -445,6 +484,9 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
     // The lock watchdog's retunes send none.
     override fun setFrequency(frequency: Long, retuneCode: ByteArray?): Boolean {
         return control("setFrequency") {
+            val retuneStart = SystemClock.uptimeMillis()
+            statRetunes.incrementAndGet()
+            if (retuneCode != null) statRetuneCodes.incrementAndGet()
             startDrop()
             val checkRegisters = ++retunesSinceRegisterCheck >= retunesPerRegisterCheck
             var report: String? = null
@@ -462,6 +504,9 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
             dropQueuedSamples(if (result >= 0) retuneCode else null)
             endDrop()
             report?.let { logRegisterCheck("retune to $frequency Hz: $it") }
+            val retuneMs = SystemClock.uptimeMillis() - retuneStart
+            statRetuneMsMax.accumulateAndGet(retuneMs) { a, b -> maxOf(a, b) }
+            if (result < 0) logLock("Retune to $frequency Hz failed ($result) after $retuneMs ms")
             if (result >= 0) watchLock(it, frequency)
             result
         }
@@ -478,6 +523,7 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
             lockRetryFrequency = frequency
             lockRetries = 0
         }
+        if (nativeTunerLocked(handle) == 0) statUnlocked.incrementAndGet()
         if (nativeTunerLocked(handle) != 0) {
             if (lockRetries > 0) logLock("PLL locked at $frequency Hz after $lockRetries retries")
             lockRetries = 0

@@ -242,3 +242,18 @@ JNIEXPORT jint JNICALL
 JNI_FN(nativeTunerLocked)(JNIEnv *env, jobject thiz, jlong handle) {
     return rtlsdr_tuner_locked(DEV(handle));
 }
+
+// Diagnostics: what librtlsdr read from the dongle (USB strings) and the tuner crystal it uses
+JNIEXPORT jstring JNICALL
+JNI_FN(nativeGetDriverInfo)(JNIEnv *env, jobject thiz, jlong handle) {
+    char manufact[256], product[256], buf[640];
+    uint32_t rtl_xtal = 0, tuner_xtal = 0;
+    if (rtlsdr_get_usb_strings(DEV(handle), manufact, product, NULL) < 0) {
+        manufact[0] = 0;
+        product[0] = 0;
+    }
+    rtlsdr_get_xtal_freq(DEV(handle), &rtl_xtal, &tuner_xtal);
+    snprintf(buf, sizeof(buf), "librtlsdr read \"%s\" / \"%s\", RTL xtal %u Hz, tuner xtal %u Hz",
+             manufact, product, rtl_xtal, tuner_xtal);
+    return (*env)->NewStringUTF(env, buf);
+}

@@ -197,6 +197,7 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
             synchronized(deviceLock) {
                 handle = nativeOpen(connection.fileDescriptor, usbDevice.deviceName)
                 tunerGains = nativeGetTunerGains(handle)
+                LogParameters.appendLine("$logTag, ${nativeGetDriverInfo(handle)}")
             }
             usbConnection = connection
             LogParameters.appendLine(
@@ -701,5 +702,6 @@ class RtlSdr(private val usbManager: UsbManager, private val usbDevice: UsbDevic
     private external fun nativeCancelAsync(handle: Long): Int
     private external fun nativeSetCenterFreqAndVerify(handle: Long, frequency: Long, result: IntArray): String?
     private external fun nativeReinitTuner(handle: Long): Int
+    private external fun nativeGetDriverInfo(handle: Long): String
     private external fun nativeTunerLocked(handle: Long): Int
 }
